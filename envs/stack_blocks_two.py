@@ -5,17 +5,210 @@ import math
 
 
 class stack_blocks_two(Base_Task):
+    """
+    Stack two blocks task with sub-task annotation support for hierarchical
+    learning experiments.
+
+    Sub-task annotations track frame boundaries and generate short-horizon
+    instructions that can be used for training VLAs with reduced ambiguity.
+
+    Features:
+    - Configurable number of distractor blocks
+    - Variable block sizes
+    - Extended color palette for visual discrimination
+    """
+
+    # Sub-task instruction templates for language generation
+    # Each template represents an atomic action for clear VLA training
+    SUBTASK_TEMPLATES = {
+        # Phase 1: Approach the object
+        "approach": [
+            "Move to {obj}",
+            "Approach {obj}",
+            "Position gripper near {obj}",
+            "Go to {obj}",
+        ],
+        # Phase 2: Grasp the object (close gripper)
+        "grasp": [
+            "Grasp {obj}",
+            "Close gripper on {obj}",
+            "Grip {obj}",
+            "Grab {obj}",
+        ],
+        # Phase 3: Lift the object
+        "lift": [
+            "Lift {obj}",
+            "Raise {obj}",
+            "Pick up {obj}",
+            "Lift the block up",
+        ],
+        # Phase 4a: Move to center (first block)
+        "move_to_center": [
+            "Move to the center",
+            "Carry to the center working area",
+            "Transport to placement position in front of you",
+            "Move to the middle of the table",
+        ],
+        # Phase 4b: Move above target (stacking)
+        "move_above_target": [
+            "Move above {base} at stacking height",
+            "Position over {base} ready to release",
+            "Carry to {base} and lower to place height",
+            "Align above {base} close enough to stack",
+        ],
+        # Phase 5a: Release (first block - place at center)
+        "release": [
+            "Release {obj}",
+            "Open gripper",
+            "Let go of {obj}",
+            "Drop {obj}",
+        ],
+        # Phase 5b: Release for stacking
+        "release_stack": [
+            "Release {obj} onto {base}",
+            "Drop {obj} on {base}",
+            "Let go to stack on {base}",
+            "Open gripper above {base}",
+        ],
+        # Phase 6: Retract after placing
+        "retract": [
+            "Move away",
+            "Retract gripper",
+            "Pull back",
+            "Clear the block",
+        ],
+        # Final: Return to home
+        "return_home": [
+            "Return to home position",
+            "Go back to start",
+            "Move to home pose",
+            "Return to ready position",
+        ],
+    }
+
+    def _generate_instruction(self, subtask_type: str, obj_name: str = None,
+                               base_name: str = None) -> str:
+        """
+        Generate a natural language instruction for a sub-task.
+
+        Args:
+            subtask_type: Type of sub-task (key in SUBTASK_TEMPLATES)
+            obj_name: Object name to substitute for {obj}
+            base_name: Base object name to substitute for {base}
+
+        Returns:
+            A randomly selected instruction with placeholders filled in.
+        """
+        templates = self.SUBTASK_TEMPLATES.get(subtask_type, ["Perform action"])
+        template = templates[np.random.randint(len(templates))]
+
+        instruction = template
+        if obj_name and "{obj}" in instruction:
+            instruction = instruction.replace("{obj}", f"the {obj_name}")
+        if base_name and "{base}" in instruction:
+            instruction = instruction.replace("{base}", f"the {base_name}")
+
+        return instruction
 
     def setup_demo(self, **kwags):
+        # Extract task variation config from domain_randomization or use defaults
+        variation_config = kwags.get("domain_randomization", {}).get("block_variation", {})
+
+        # Number of distractor blocks (0 = no distractors, original behavior)
+        self.num_distractors = variation_config.get("num_distractors", 0)
+
+        # Size variation: [min_scale, max_scale] relative to base size (0.025)
+        # e.g., [0.8, 1.2] means 80% to 120% of base size
+        self.size_variation = variation_config.get("size_variation", [1.0, 1.0])
+
+        # Whether to randomize target block colors (vs fixed red/green)
+        self.randomize_colors = variation_config.get("randomize_colors", False)
+
         super()._init_task_env_(**kwags)
+        # Enable sub-task annotations (uses base class infrastructure)
+        self.enable_subtask_annotations()
 
     def load_actors(self):
-        block_half_size = 0.025
+        base_half_size = 0.025
+        total_blocks = 2 + self.num_distractors
+
+        # Select colors for all blocks
+        color_names = list(self.COLOR_PALETTE.keys())
+
+        if self.randomize_colors:
+            # Randomly select colors, ensuring target blocks have different colors
+            selected_colors = list(np.random.choice(color_names, min(total_blocks, len(color_names)), replace=False))
+            # If we need more colors than available, allow repeats for distractors
+            while len(selected_colors) < total_blocks:
+                selected_colors.append(color_names[np.random.randint(len(color_names))])
+        else:
+            # Fixed colors for target blocks (red, green), random for distractors
+            selected_colors = ["red", "green"]
+            remaining_colors = [c for c in color_names if c not in selected_colors]
+            for _ in range(self.num_distractors):
+                if remaining_colors:
+                    idx = np.random.randint(len(remaining_colors))
+                    color = remaining_colors[idx]
+                    selected_colors.append(color)
+                    remaining_colors.remove(color)
+                else:
+                    # If we run out of unique colors, pick any that's not red/green
+                    non_target_colors = [c for c in color_names if c not in ["red", "green"]]
+                    selected_colors.append(non_target_colors[np.random.randint(len(non_target_colors))])
+
+        # Store color names for annotations
+        self.block_color_names = selected_colors
+
+        # Generate sizes for all blocks
+        block_sizes = []
+        for _ in range(total_blocks):
+            scale = np.random.uniform(self.size_variation[0], self.size_variation[1])
+            block_sizes.append(base_half_size * scale)
+
+        # Generate non-overlapping poses for all blocks
         block_pose_lst = []
-        for i in range(2):
+        block_size_lst = []
+
+        # Target stacking area (center) - distractors must avoid this
+        # Exclusion zone around stacking position
+        target_center = np.array([0, -0.13])
+        target_exclusion_radius = 0.05  # 5cm radius around stacking zone
+
+        # Extra clearance for gripper to approach target blocks
+        gripper_clearance = 0.05  # 5cm clearance for gripper approach
+
+        def check_block_pose(new_pose, new_size, is_distractor=False):
+            """Check if new block overlaps with existing blocks or forbidden areas."""
+            # Check overlap with existing blocks
+            for j, (existing_pose, existing_size) in enumerate(zip(block_pose_lst, block_size_lst)):
+                # Base minimum distance: sum of half-sizes (to not overlap) + 2cm margin
+                min_dist = new_size + existing_size + 0.02
+
+                # Distractors need extra clearance from target blocks (first two)
+                # to allow gripper approach
+                if is_distractor and j < 2:
+                    min_dist += gripper_clearance
+
+                if np.sum(pow(new_pose.p[:2] - existing_pose.p[:2], 2)) < min_dist ** 2:
+                    return False
+
+            # Distractors must stay away from target stacking area
+            if is_distractor:
+                dist_to_target = np.sqrt(np.sum(pow(new_pose.p[:2] - target_center, 2)))
+                if dist_to_target < target_exclusion_radius + new_size:
+                    return False
+
+            return True
+
+        for i in range(total_blocks):
+            block_half_size = block_sizes[i]
+            max_attempts = 100
+            attempts = 0
+            is_distractor = (i >= 2)  # First two are target blocks
+
             block_pose = rand_pose(
                 xlim=[-0.28, 0.28],
-                ylim=[-0.08, 0.05],
+                ylim=[-0.20, 0.12],
                 zlim=[0.741 + block_half_size],
                 qpos=[1, 0, 0, 0],
                 ylim_prop=True,
@@ -23,91 +216,252 @@ class stack_blocks_two(Base_Task):
                 rotate_lim=[0, 0, 0.75],
             )
 
-            def check_block_pose(block_pose):
-                for j in range(len(block_pose_lst)):
-                    if (np.sum(pow(block_pose.p[:2] - block_pose_lst[j].p[:2], 2)) < 0.01):
-                        return False
-                return True
+            def is_valid_pose(pose):
+                return (
+                    abs(pose.p[0]) >= 0.05 and  # Keep center strip clear for arm movement
+                    check_block_pose(pose, block_half_size, is_distractor)
+                )
 
-            while (abs(block_pose.p[0]) < 0.05 or np.sum(pow(block_pose.p[:2] - np.array([0, -0.1]), 2)) < 0.0225
-                   or not check_block_pose(block_pose)):
+            while attempts < max_attempts and not is_valid_pose(block_pose):
                 block_pose = rand_pose(
                     xlim=[-0.28, 0.28],
-                    ylim=[-0.08, 0.05],
+                    ylim=[-0.20, 0.12],
                     zlim=[0.741 + block_half_size],
                     qpos=[1, 0, 0, 0],
                     ylim_prop=True,
                     rotate_rand=True,
                     rotate_lim=[0, 0, 0.75],
                 )
-            block_pose_lst.append(deepcopy(block_pose))
+                attempts += 1
 
-        def create_block(block_pose, color):
+            # Verify final position is valid before adding
+            if is_valid_pose(block_pose):
+                block_pose_lst.append(deepcopy(block_pose))
+                block_size_lst.append(block_half_size)
+            elif is_distractor:
+                # Skip this distractor if no valid position found
+                print(f"Warning: Could not place distractor {i-1}, skipping")
+                block_sizes[i] = None  # Mark as skipped
+            else:
+                # Target blocks must be placed - this shouldn't happen normally
+                raise RuntimeError(f"Could not find valid position for target block {i}")
+
+        def create_block(block_pose, color_rgb, half_size, name="box"):
             return create_box(
                 scene=self,
                 pose=block_pose,
-                half_size=(block_half_size, block_half_size, block_half_size),
-                color=color,
-                name="box",
+                half_size=(half_size, half_size, half_size),
+                color=color_rgb,
+                name=name,
             )
 
-        self.block1 = create_block(block_pose_lst[0], (1, 0, 0))
-        self.block2 = create_block(block_pose_lst[1], (0, 1, 0))
+        # Create target blocks (first two)
+        color1_rgb = self.COLOR_PALETTE[selected_colors[0]]
+        color2_rgb = self.COLOR_PALETTE[selected_colors[1]]
+
+        self.block1 = create_block(block_pose_lst[0], color1_rgb, block_size_lst[0], "target_block_1")
+        self.block2 = create_block(block_pose_lst[1], color2_rgb, block_size_lst[1], "target_block_2")
+
         self.add_prohibit_area(self.block1, padding=0.07)
         self.add_prohibit_area(self.block2, padding=0.07)
+
+        # Add blocks to size_dict for cluttered object spacing
+        # Format: [x, y, z, radius] - radius used for distance calculations
+        block1_pos = block_pose_lst[0].p
+        block2_pos = block_pose_lst[1].p
+        self.size_dict.append([block1_pos[0], block1_pos[1], block1_pos[2], block_size_lst[0] + 0.03])
+        self.size_dict.append([block2_pos[0], block2_pos[1], block2_pos[2], block_size_lst[1] + 0.03])
+
+        # Create distractor blocks (only for those that were successfully placed)
+        self.distractor_blocks = []
+        num_placed_distractors = len(block_pose_lst) - 2  # Subtract target blocks
+        color_idx = 2  # Start after target block colors
+        for i in range(num_placed_distractors):
+            pose_idx = i + 2  # Offset by 2 for target blocks in pose list
+            color_rgb = self.COLOR_PALETTE[selected_colors[color_idx]]
+            distractor = create_block(
+                block_pose_lst[pose_idx], color_rgb, block_size_lst[pose_idx],
+                f"distractor_block_{i}"
+            )
+            self.distractor_blocks.append(distractor)
+            self.add_prohibit_area(distractor, padding=0.05)
+
+            # Add distractor to size_dict as well
+            dist_pos = block_pose_lst[pose_idx].p
+            self.size_dict.append([dist_pos[0], dist_pos[1], dist_pos[2], block_size_lst[pose_idx] + 0.03])
+            color_idx += 1
+
+        # Update actual distractor count
+        self.num_distractors = num_placed_distractors
+
+        # Target placement area
         target_pose = [-0.04, -0.13, 0.04, -0.05]
         self.prohibited_area.append(target_pose)
         self.block1_target_pose = [0, -0.13, 0.75 + self.table_z_bias, 0, 1, 0, 0]
+
+        # Store size information for potential use in instructions
+        self.block1_size = block_size_lst[0]
+        self.block2_size = block_size_lst[1]
 
     def play_once(self):
         # Initialize tracking variables for gripper and actor
         self.last_gripper = None
         self.last_actor = None
 
+        # Define block names for annotations using dynamic colors
+        block1_color = self.block_color_names[0]
+        block2_color = self.block_color_names[1]
+        self.block_names = {
+            id(self.block1): f"{block1_color} block",
+            id(self.block2): f"{block2_color} block",
+        }
+
         # Pick and place the first block (block1) and get its arm tag
         arm_tag1 = self.pick_and_place_block(self.block1)
         # Pick and place the second block (block2) and get its arm tag
-        arm_tag2 = self.pick_and_place_block(self.block2)
+        arm_tag2 = self.pick_and_place_block(self.block2, base_block=self.block1)
+
+        # Return both arms to home position
+        self.start_subtask("return_home", arm_tag=str(arm_tag1))
+        instruction = self._generate_instruction("return_home")
+        self.move(
+            self.back_to_origin(arm_tag=ArmTag(arm_tag1)),
+            self.back_to_origin(arm_tag=ArmTag(arm_tag2)) if arm_tag1 != arm_tag2 else None,
+        )
+        self.end_subtask(instruction)
 
         # Store information about the blocks and their associated arms
         self.info["info"] = {
-            "{A}": "red block",
-            "{B}": "green block",
+            "{A}": f"{block1_color} block",
+            "{B}": f"{block2_color} block",
             "{a}": arm_tag1,
             "{b}": arm_tag2,
         }
+
+        # Store additional scene information for data analysis
+        self.info["block_variation"] = {
+            "block1_color": block1_color,
+            "block2_color": block2_color,
+            "block1_size": self.block1_size,
+            "block2_size": self.block2_size,
+            "num_distractors": self.num_distractors,
+            "distractor_colors": self.block_color_names[2:] if self.num_distractors > 0 else [],
+        }
+
+        # Save sub-task annotations
+        self.save_subtask_annotations()
+
         return self.info
 
-    def pick_and_place_block(self, block: Actor):
+    def pick_and_place_block(self, block: Actor, base_block: Actor = None):
+        """
+        Pick up a block and place it (either at center or stacked on base_block).
+
+        Uses atomic sub-task decomposition for clear VLA training:
+        1. approach - move gripper to block
+        2. grasp - close gripper
+        3. lift - raise block
+        4. move_to_target - transport to destination
+        5. release - open gripper
+        6. retract - move away
+
+        Args:
+            block: The block to pick up and place
+            base_block: If provided, stack block on top of this block
+
+        Returns:
+            The arm tag used ("left" or "right")
+        """
         block_pose = block.get_pose().p
         arm_tag = ArmTag("left" if block_pose[0] < 0 else "right")
 
+        # Get block names for instructions
+        block_name = self.block_names.get(id(block), "block")
+        base_name = self.block_names.get(id(base_block), None) if base_block else None
+
+        # Compute grasp poses
+        pre_grasp_pose, grasp_pose = self.choose_grasp_pose(
+            block, arm_tag=arm_tag, pre_dis=0.09, target_dis=0
+        )
+
+        # === SUB-TASK 1: Approach ===
+        self.start_subtask("approach", obj_name=block_name, arm_tag=str(arm_tag))
+        instruction = self._generate_instruction("approach", obj_name=block_name)
+
         if self.last_gripper is not None and (self.last_gripper != arm_tag):
+            # Move to pre-grasp while returning opposite arm
             self.move(
-                self.grasp_actor(block, arm_tag=arm_tag, pre_grasp_dis=0.09),  # arm_tag
-                self.back_to_origin(arm_tag=arm_tag.opposite),  # arm_tag.opposite
+                self.move_to_pose(arm_tag, pre_grasp_pose),
+                self.back_to_origin(arm_tag=arm_tag.opposite),
             )
         else:
-            self.move(self.grasp_actor(block, arm_tag=arm_tag, pre_grasp_dis=0.09))  # arm_tag
+            self.move(self.move_to_pose(arm_tag, pre_grasp_pose))
 
-        self.move(self.move_by_displacement(arm_tag=arm_tag, z=0.07))  # arm_tag
+        # Move to grasp pose (final approach)
+        if pre_grasp_pose != grasp_pose:
+            self.move((arm_tag, [Action(arm_tag, "move", target_pose=grasp_pose,
+                                        constraint_pose=[1, 1, 1, 0, 0, 0])]))
+        self.end_subtask(instruction)
 
+        # === SUB-TASK 2: Grasp ===
+        self.start_subtask("grasp", obj_name=block_name, arm_tag=str(arm_tag))
+        instruction = self._generate_instruction("grasp", obj_name=block_name)
+        self.move(self.close_gripper(arm_tag, pos=0.0))
+        self.end_subtask(instruction)
+
+        # === SUB-TASK 3: Lift ===
+        self.start_subtask("lift", obj_name=block_name, arm_tag=str(arm_tag))
+        instruction = self._generate_instruction("lift", obj_name=block_name)
+        self.move(self.move_by_displacement(arm_tag=arm_tag, z=0.07))
+        self.end_subtask(instruction)
+
+        # Determine target pose
         if self.last_actor is None:
             target_pose = [0, -0.13, 0.75 + self.table_z_bias, 0, 1, 0, 0]
         else:
             target_pose = self.last_actor.get_functional_point(1)
 
-        self.move(
-            self.place_actor(
-                block,
-                target_pose=target_pose,
-                arm_tag=arm_tag,
-                functional_point_id=0,
-                pre_dis=0.05,
-                dis=0.,
-                pre_dis_axis="fp",
-            ))
-        self.move(self.move_by_displacement(arm_tag=arm_tag, z=0.07))  # arm_tag
+        # Compute place poses
+        place_pre_pose = self.get_place_pose(
+            block, arm_tag, target_pose,
+            functional_point_id=0, pre_dis=0.05, pre_dis_axis="fp"
+        )
+        place_pose = self.get_place_pose(
+            block, arm_tag, target_pose,
+            functional_point_id=0, pre_dis=0., pre_dis_axis="fp"
+        )
+
+        # === SUB-TASK 4: Move to target ===
+        if base_block is None:
+            self.start_subtask("move_to_center", obj_name=block_name, arm_tag=str(arm_tag))
+            instruction = self._generate_instruction("move_to_center")
+        else:
+            self.start_subtask("move_above_target", obj_name=block_name,
+                              base_name=base_name, arm_tag=str(arm_tag))
+            instruction = self._generate_instruction("move_above_target", base_name=base_name)
+
+        self.move(self.move_to_pose(arm_tag, place_pre_pose))
+        # Move to final place position
+        self.move(self.move_to_pose(arm_tag, place_pose))
+        self.end_subtask(instruction)
+
+        # === SUB-TASK 5: Release ===
+        if base_block is None:
+            self.start_subtask("release", obj_name=block_name, arm_tag=str(arm_tag))
+            instruction = self._generate_instruction("release", obj_name=block_name)
+        else:
+            self.start_subtask("release_stack", obj_name=block_name,
+                              base_name=base_name, arm_tag=str(arm_tag))
+            instruction = self._generate_instruction("release_stack", obj_name=block_name,
+                                                      base_name=base_name)
+        self.move(self.open_gripper(arm_tag, pos=1.0))
+        self.end_subtask(instruction)
+
+        # === SUB-TASK 6: Retract ===
+        self.start_subtask("retract", obj_name=block_name, arm_tag=str(arm_tag))
+        instruction = self._generate_instruction("retract")
+        self.move(self.move_by_displacement(arm_tag=arm_tag, z=0.07))
+        self.end_subtask(instruction)
 
         self.last_gripper = arm_tag
         self.last_actor = block
@@ -116,7 +470,16 @@ class stack_blocks_two(Base_Task):
     def check_success(self):
         block1_pose = self.block1.get_pose().p
         block2_pose = self.block2.get_pose().p
-        eps = [0.025, 0.025, 0.012]
 
-        return (np.all(abs(block2_pose - np.array(block1_pose[:2].tolist() + [block1_pose[2] + 0.05])) < eps)
+        # Calculate expected z-offset based on actual block sizes
+        # block2 should sit on top of block1
+        expected_z_offset = self.block1_size + self.block2_size
+
+        # Tolerance scales with block size
+        min_size = min(self.block1_size, self.block2_size)
+        eps = [min_size, min_size, min_size * 0.5]
+
+        expected_pos = np.array([block1_pose[0], block1_pose[1], block1_pose[2] + expected_z_offset])
+
+        return (np.all(abs(block2_pose - expected_pos) < eps)
                 and self.is_left_gripper_open() and self.is_right_gripper_open())

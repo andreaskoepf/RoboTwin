@@ -53,29 +53,16 @@ try:
                 yml_data = yaml.safe_load(f)
             self.frame_bias = yml_data["planner"]["frame_bias"]
 
-            # motion generation
+            # motion generation - disable world obstacles for testing
             if True:
-                world_config = {
-                    "cuboid": {
-                        "table": {
-                            "dims": [0.7, 2, 0.04],  # x, y, z
-                            "pose": [
-                                self.robot_origion_pose.p[1],
-                                0.0,
-                                0.74 - self.robot_origion_pose.p[2],
-                                1,
-                                0,
-                                0,
-                                0.0,
-                            ],  # x, y, z, qw, qx, qy, qz
-                        },
-                    }
-                }
+                world_config = None  # No obstacles for testing
             motion_gen_config = MotionGenConfig.load_from_robot_config(
                 self.yml_path,
                 world_config,
                 interpolation_dt=1 / 250,
                 num_trajopt_seeds=1,
+                collision_activation_distance=0.0,
+                self_collision_check=False,
             )
 
             self.motion_gen = MotionGen(motion_gen_config)
@@ -86,6 +73,8 @@ try:
                 interpolation_dt=1 / 250,
                 num_trajopt_seeds=1,
                 num_graph_seeds=1,
+                collision_activation_distance=0.0,
+                self_collision_check=False,
             )
             self.motion_gen_batch = MotionGen(motion_gen_config)
             self.motion_gen_batch.warmup(batch=CONFIGS.ROTATE_NUM)

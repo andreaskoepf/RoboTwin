@@ -35,6 +35,23 @@ parent_directory = os.path.dirname(current_file_path)
 
 class Base_Task(gym.Env):
 
+    # Shared color palette for block/object tasks
+    # Format: (R, G, B) normalized to [0, 1], with human-readable name
+    COLOR_PALETTE = {
+        "red": (0.9, 0.1, 0.1),
+        "green": (0.1, 0.8, 0.1),
+        "blue": (0.1, 0.2, 0.9),
+        "yellow": (0.95, 0.9, 0.1),
+        "orange": (1.0, 0.5, 0.0),
+        "purple": (0.6, 0.1, 0.8),
+        "cyan": (0.0, 0.85, 0.85),
+        "pink": (1.0, 0.4, 0.7),
+        "brown": (0.55, 0.27, 0.07),
+        "white": (0.95, 0.95, 0.95),
+        "gray": (0.5, 0.5, 0.5),
+        "lime": (0.5, 1.0, 0.0),
+    }
+
     def __init__(self):
         pass
 
@@ -157,6 +174,160 @@ class Base_Task(gym.Env):
         self.info["info"] = {}
 
         self.stage_success_tag = False
+
+        # Sub-task annotation tracking
+        self._subtask_annotations = []
+        self._current_subtask = None
+        self._subtask_start_frame = 0
+        self._subtask_enabled = False  # Enable via enable_subtask_annotations()
+
+    # ==================== Sub-task Annotation Methods ====================
+
+    def enable_subtask_annotations(self):
+        """Enable sub-task annotation tracking for this episode."""
+        self._subtask_enabled = True
+        self._subtask_annotations = []
+        self._current_subtask = None
+        self._subtask_start_frame = 0
+
+    def start_subtask(self, subtask_type: str, obj_name: str = None,
+                      base_name: str = None, arm_tag: str = None,
+                      metadata: dict = None):
+        """
+        Mark the beginning of a sub-task for annotation.
+
+        Args:
+            subtask_type: Type of sub-task (e.g., "approach", "grasp", "lift")
+            obj_name: Name of the object being manipulated (e.g., "red block")
+            base_name: Name of the base/target object (e.g., for stacking)
+            arm_tag: Which arm is being used ("left" or "right")
+            metadata: Additional task-specific metadata
+        """
+        if not self._subtask_enabled:
+            return
+
+        self._subtask_start_frame = self.FRAME_IDX
+        self._current_subtask = {
+            "type": subtask_type,
+            "obj": obj_name,
+            "base": base_name,
+            "arm": arm_tag,
+            "metadata": metadata or {},
+        }
+
+    def end_subtask(self, instruction: str = None):
+        """
+        Mark the end of the current sub-task and record the annotation.
+
+        Args:
+            instruction: Optional explicit instruction string. If not provided,
+                        the instruction field will be set to None and should
+                        be filled in by the task-specific code.
+        """
+        if not self._subtask_enabled or self._current_subtask is None:
+            return
+
+        end_frame = self.FRAME_IDX
+
+        annotation = {
+            "subtask_id": len(self._subtask_annotations),
+            "type": self._current_subtask["type"],
+            "start_frame": self._subtask_start_frame,
+            "end_frame": end_frame,
+            "num_frames": end_frame - self._subtask_start_frame,
+            "instruction": instruction,
+            "obj": self._current_subtask["obj"],
+            "base": self._current_subtask["base"],
+            "arm": self._current_subtask["arm"],
+            "metadata": self._current_subtask["metadata"],
+        }
+
+        self._subtask_annotations.append(annotation)
+        self._current_subtask = None
+
+        return annotation
+
+    def get_subtask_annotations(self) -> list:
+        """
+        Return the list of sub-task annotations for this episode.
+
+        Returns:
+            List of annotation dictionaries with frame ranges and instructions.
+        """
+        return self._subtask_annotations
+
+    def get_frame_to_subtask_index(self, total_frames: int = None) -> list:
+        """
+        Generate a frame-to-subtask-index lookup array from the annotations.
+
+        This creates a list where index i contains the subtask_id for frame i,
+        making it O(1) to look up which subtask a frame belongs to during
+        data loading and batch preparation.
+
+        Args:
+            total_frames: Total number of frames. If None, uses self.FRAME_IDX.
+
+        Returns:
+            List of length total_frames where each element is the subtask_id
+            for that frame, or -1 if the frame is not within any subtask.
+        """
+        if total_frames is None:
+            total_frames = self.FRAME_IDX
+
+        # Initialize all frames to -1 (no subtask)
+        frame_to_subtask = [-1] * total_frames
+
+        # Fill in subtask IDs based on frame ranges
+        for subtask in self._subtask_annotations:
+            subtask_id = subtask["subtask_id"]
+            start = subtask["start_frame"]
+            end = subtask["end_frame"]
+            for frame_idx in range(start, min(end, total_frames)):
+                frame_to_subtask[frame_idx] = subtask_id
+
+        return frame_to_subtask
+
+    def save_subtask_annotations(self, subdir: str = "subtask_annotations"):
+        """
+        Save sub-task annotations to a JSON file alongside trajectory data.
+
+        Args:
+            subdir: Subdirectory name within save_dir for annotations
+        """
+        if not self.save_data or not self._subtask_enabled:
+            return
+
+        save_path = getattr(self, 'save_dir', './data')
+        annotations_dir = os.path.join(save_path, subdir)
+        os.makedirs(annotations_dir, exist_ok=True)
+
+        annotations_file = os.path.join(
+            annotations_dir, f"episode{self.ep_num}.json"
+        )
+
+        # Generate frame-to-subtask lookup array
+        frame_to_subtask = self.get_frame_to_subtask_index()
+
+        # Create summary with all sub-tasks
+        annotation_data = {
+            "task_name": self.task_name,
+            "episode": self.ep_num,
+            "total_frames": self.FRAME_IDX,
+            "num_subtasks": len(self._subtask_annotations),
+            "subtasks": self._subtask_annotations,
+            "frame_to_subtask": frame_to_subtask,  # O(1) lookup array
+            "task_info": self.info.get("info", {}),
+        }
+
+        with open(annotations_file, 'w') as f:
+            json.dump(annotation_data, f, indent=2)
+
+        print(f"Saved {len(self._subtask_annotations)} sub-task annotations "
+              f"to {annotations_file}")
+
+        return annotations_file
+
+    # ==================== Stability Check ====================
 
     def check_stable(self):
         actors_list, actors_pose_list = [], []
@@ -1013,7 +1184,9 @@ class Base_Task(gym.Env):
             plan_multi_pose = self.robot.right_plan_multi_path
         target_lst = self.robot.create_target_pose_list(res_pose, center_pose, arm_tag)
         pose_num = len(target_lst)
+
         traj_lst = plan_multi_pose(target_lst)
+
         now_pose = None
         now_step = -1
         for i in range(pose_num):
