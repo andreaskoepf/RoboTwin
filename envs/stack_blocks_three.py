@@ -129,7 +129,7 @@ class stack_blocks_three(Base_Task):
         self.enable_subtask_annotations()
 
     def load_actors(self):
-        base_half_size = 0.025
+        base_half_size = 0.020  # 2cm half-size = 4cm cubes (smaller for 3-block stacking)
         total_blocks = 3 + self.num_distractors
 
         # Select colors for all blocks
@@ -171,7 +171,7 @@ class stack_blocks_three(Base_Task):
 
         # Target stacking area (center) - distractors must avoid this
         # Exclusion zone around stacking position
-        target_center = np.array([0, -0.13])
+        target_center = np.array([0, -0.18])
         target_exclusion_radius = 0.05  # 5cm radius around stacking zone
 
         # Extra clearance for gripper to approach target blocks
@@ -300,9 +300,9 @@ class stack_blocks_three(Base_Task):
         self.num_distractors = num_placed_distractors
 
         # Target placement area
-        target_pose = [-0.04, -0.13, 0.04, -0.05]
+        target_pose = [-0.04, -0.18, 0.04, -0.10]
         self.prohibited_area.append(target_pose)
-        self.block1_target_pose = [0, -0.13, 0.75 + self.table_z_bias, 0, 1, 0, 0]
+        self.block1_target_pose = [0, -0.18, 0.75 + self.table_z_bias, 0, 1, 0, 0]
 
         # Store size information for potential use in instructions
         self.block1_size = block_size_lst[0]
@@ -436,7 +436,7 @@ class stack_blocks_three(Base_Task):
 
         # Determine target pose
         if self.last_actor is None:
-            target_pose = [0, -0.13, 0.75 + self.table_z_bias, 0, 1, 0, 0]
+            target_pose = [0, -0.18, 0.75 + self.table_z_bias, 0, 1, 0, 0]
         else:
             target_pose = self.last_actor.get_functional_point(1)
 
@@ -479,7 +479,7 @@ class stack_blocks_three(Base_Task):
         # === SUB-TASK 6: Retract ===
         self.start_subtask("retract", obj_name=block_name, arm_tag=str(arm_tag))
         instruction = self._generate_instruction("retract")
-        self.move(self.move_by_displacement(arm_tag=arm_tag, z=0.07))
+        self.move(self.move_by_displacement(arm_tag=arm_tag, z=0.05))
         self.end_subtask(instruction)
 
         self.last_gripper = arm_tag
