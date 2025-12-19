@@ -52,6 +52,11 @@ class Base_Task(gym.Env):
         "lime": (0.5, 1.0, 0.0),
     }
 
+    # Gripper padding alpha: fraction of extra steps to hold at target position after reaching it.
+    # Default 0.5 adds 100 steps (50% of 200 base steps) of hold time.
+    # Set lower (e.g., 0.05) to reduce zero-action frames in training data.
+    gripper_alpha = 0.5
+
     def __init__(self):
         pass
 
@@ -317,6 +322,7 @@ class Base_Task(gym.Env):
             "subtasks": self._subtask_annotations,
             "frame_to_subtask": frame_to_subtask,  # O(1) lookup array
             "task_info": self.info.get("info", {}),
+            "extra_info": {k: v for k, v in self.info.items() if k != "info"},
         }
 
         with open(annotations_file, 'w') as f:
@@ -781,7 +787,7 @@ class Base_Task(gym.Env):
         - `right_pos`: Right gripper pose
         - `set_tag`: "left" to set the left gripper, "right" to set the right gripper, "together" to set both grippers simultaneously.
         """
-        alpha = 0.5
+        alpha = self.gripper_alpha
 
         left_result, right_result = None, None
 
@@ -1055,9 +1061,9 @@ class Base_Task(gym.Env):
     def move(
         self,
         actions_by_arm1: tuple[ArmTag, list[Action]],
-        actions_by_arm2: tuple[ArmTag, list[Action]] = None,
-        save_freq=-1,
-    ):
+        actions_by_arm2: Optional[tuple[ArmTag, list[Action]]] = None,
+        save_freq: int = -1,
+    ) -> bool:
         """
         Take action for the robot.
         """
@@ -1574,6 +1580,125 @@ class Base_Task(gym.Env):
             return self.robot.get_right_ee_pose()
         else:
             raise ValueError(f'arm_tag must be either "left" or "right", not {arm_tag}')
+
+    def _set_arm_to_config(self, arm_tag, joint_config):
+        """
+        Directly set the robot arm to a specific joint configuration.
+
+        This teleports the arm without animation, for setting initial poses.
+        Note: Does NOT update robot.left/right_original_pose, so back_to_origin()
+        still returns to the true home position.
+
+        Args:
+            arm_tag: Which arm to set ("left" or "right")
+            joint_config: Array of joint positions
+        """
+        if arm_tag == "left":
+            joints = self.robot.left_arm_joints
+        else:
+            joints = self.robot.right_arm_joints
+
+        for i, joint in enumerate(joints):
+            joint.set_drive_target(joint_config[i])
+
+        # Run simulation steps to let the robot settle at the new position
+        for _ in range(100):
+            self.scene.step()
+
+    def _generate_random_start_config(self, target_actor, arm_tag):
+        """
+        Generate a random starting configuration near a target actor.
+
+        This creates diverse approach trajectories by sampling random positions
+        in a region around the target, ensuring the robot can approach from
+        many different directions during training.
+
+        Note: Relies on height constraints (min 15cm above table) to avoid
+        collisions with clutter. The motion planner doesn't check collisions.
+
+        Requires self.random_start_offset_range and self.random_start_height_range
+        to be set (typically in setup_demo).
+
+        Args:
+            target_actor: The actor the robot will approach
+            arm_tag: Which arm to use ("left" or "right")
+
+        Returns:
+            A tuple (joint_config, ee_pose) where joint_config is the joint
+            positions and ee_pose is the end-effector pose, or (None, None)
+            if no valid configuration could be found.
+        """
+        import math
+        import transforms3d as t3d
+        from ._GLOBAL_CONFIGS import GRASP_DIRECTION_DIC
+
+        actor_pose = target_actor.get_pose().p
+        table_z = 0.74 + self.table_z_bias
+
+        # Sample random position in a region around the actor
+        max_attempts = 30
+        for _ in range(max_attempts):
+            # Random angle around the actor (full 360 degrees)
+            angle = np.random.uniform(0, 2 * math.pi)
+
+            # Random horizontal offset
+            offset_dist = np.random.uniform(
+                self.random_start_offset_range[0],
+                self.random_start_offset_range[1]
+            )
+
+            # Random height above table
+            height = np.random.uniform(
+                self.random_start_height_range[0],
+                self.random_start_height_range[1]
+            )
+
+            # Calculate position
+            x = actor_pose[0] + offset_dist * math.cos(angle)
+            y = actor_pose[1] + offset_dist * math.sin(angle)
+            z = table_z + height
+
+            # Constrain to workspace (avoid extreme positions)
+            # Minimum height is 15cm above table to avoid cluttered objects
+            x = np.clip(x, -0.35, 0.35)
+            y = np.clip(y, -0.25, 0.10)
+            z = np.clip(z, table_z + 0.15, table_z + 0.30)
+
+            # Sample from multiple base orientations for maximum diversity
+            # These cover various approach angles: top-down, angled, and side approaches
+            orientation_choices = [
+                "top_down",
+                "top_down_little_left",
+                "top_down_little_right",
+                "front_left",
+                "front",
+                "front_right",
+            ]
+            chosen_direction = orientation_choices[np.random.randint(len(orientation_choices))]
+            base_quat = GRASP_DIRECTION_DIC.get(chosen_direction, [0.5, 0.5, -0.5, 0.5])
+
+            # Add random rotation for additional variety (up to 25 degrees on each axis)
+            base_mat = t3d.quaternions.quat2mat(base_quat)
+            rand_angles = np.random.uniform(-0.44, 0.44, 3)  # ~25 degrees in radians
+            rand_rot = t3d.euler.euler2mat(rand_angles[0], rand_angles[1], rand_angles[2])
+            final_mat = base_mat @ rand_rot
+            final_quat = t3d.quaternions.mat2quat(final_mat)
+
+            target_pose = [x, y, z] + list(final_quat)
+
+            # Use planner to get joint configuration for this pose
+            if arm_tag == "left":
+                result = self.robot.left_plan_path(target_pose)
+            else:
+                result = self.robot.right_plan_path(target_pose)
+
+            if result is not None and result.get("status") == "Success":
+                # Extract final joint configuration from the planned path
+                joint_config = result["position"][-1]
+                return joint_config, target_pose
+
+        # Failed to find a valid configuration
+        return None, None
 
     # =========================================================== Control Robot ===========================================================
 

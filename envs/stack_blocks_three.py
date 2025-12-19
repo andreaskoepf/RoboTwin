@@ -1,7 +1,5 @@
 from ._base_task import Base_Task
 from .utils import *
-import sapien
-import math
 
 
 class stack_blocks_three(Base_Task):
@@ -123,6 +121,15 @@ class stack_blocks_three(Base_Task):
 
         # Whether to randomize target block colors (vs fixed red/green/blue)
         self.randomize_colors = variation_config.get("randomize_colors", False)
+
+        # Random start pose configuration
+        # This enables diverse approach trajectories for more robust training
+        random_start_config = kwags.get("domain_randomization", {}).get("random_start_pose", {})
+        self.random_start_probability = random_start_config.get("probability", 0.0)
+        # Height range for random start positions (relative to table)
+        self.random_start_height_range = random_start_config.get("height_range", [0.08, 0.25])
+        # Horizontal offset range from target block (wider range for diverse approaches)
+        self.random_start_offset_range = random_start_config.get("offset_range", [0.10, 0.25])
 
         super()._init_task_env_(**kwags)
         # Enable sub-task annotations (uses base class infrastructure)
@@ -324,6 +331,27 @@ class stack_blocks_three(Base_Task):
             id(self.block3): f"{block3_color} block",
         }
 
+        # Random start position logic
+        # This helps generate diverse approach trajectories for robust training
+        self._random_start_used = False
+        self._random_start_pose = None
+
+        if self.random_start_probability > 0 and np.random.random() < self.random_start_probability:
+            # Determine which arm will be used for the first block
+            block1_pose = self.block1.get_pose().p
+            first_arm_tag = "left" if block1_pose[0] < 0 else "right"
+
+            # Generate random start configuration near the first block
+            joint_config, ee_pose = self._generate_random_start_config(
+                self.block1, first_arm_tag
+            )
+
+            if joint_config is not None:
+                # Set the arm directly to the random start configuration
+                self._set_arm_to_config(first_arm_tag, joint_config)
+                self._random_start_used = True
+                self._random_start_pose = ee_pose
+
         # Pick and place the first block (block1) - goes to center
         arm_tag1 = self.pick_and_place_block(self.block1)
         # Pick and place the second block (block2) - stacks on block1
@@ -365,6 +393,13 @@ class stack_blocks_three(Base_Task):
             "block3_size": self.block3_size,
             "num_distractors": self.num_distractors,
             "distractor_colors": self.block_color_names[3:] if self.num_distractors > 0 else [],
+        }
+
+        # Store random start information
+        self.info["random_start"] = {
+            "used": self._random_start_used,
+            "probability": self.random_start_probability,
+            "start_pose": self._random_start_pose,
         }
 
         # Save sub-task annotations
