@@ -29,8 +29,8 @@ def class_decorator(task_name):
     return env_instance
 
 
-def get_embodiment_config(robot_file):
-    robot_config_file = os.path.join(robot_file, "config.yml")
+def get_embodiment_config(robot_file, config_name="config.yml"):
+    robot_config_file = os.path.join(robot_file, config_name)
     with open(robot_config_file, "r", encoding="utf-8") as f:
         embodiment_args = yaml.load(f.read(), Loader=yaml.FullLoader)
     return embodiment_args
@@ -70,8 +70,9 @@ def main(task_name=None, task_config=None):
     else:
         raise "number of embodiment config parameters should be 1 or 3"
 
-    args["left_embodiment_config"] = get_embodiment_config(args["left_robot_file"])
-    args["right_embodiment_config"] = get_embodiment_config(args["right_robot_file"])
+    embodiment_config_name = args.get("embodiment_config", "config.yml")
+    args["left_embodiment_config"] = get_embodiment_config(args["left_robot_file"], embodiment_config_name)
+    args["right_embodiment_config"] = get_embodiment_config(args["right_robot_file"], embodiment_config_name)
 
     if len(embodiment_type) == 1:
         embodiment_name = str(embodiment_type[0])
@@ -190,47 +191,129 @@ def run(TASK_ENV, args):
 
         clear_cache_freq = args["clear_cache_freq"]
 
-        st_idx = 0
-
         def exist_hdf5(idx):
             file_path = os.path.join(args["save_path"], 'data', f'episode{idx}.hdf5')
             return os.path.exists(file_path)
 
-        while exist_hdf5(st_idx):
-            st_idx += 1
+        # Optional episode-range mode so several workers can collect disjoint
+        # ranges in parallel (on different GPUs). Set via env vars:
+        #   COLLECT_EP_START / COLLECT_EP_END  -> [start, end) episode range
+        #   COLLECT_SEED_OFFSET                -> per-worker offset for the fresh
+        #                                         re-plan seed pool (keeps replanned
+        #                                         episodes unique across workers)
+        ep_start = int(os.environ.get("COLLECT_EP_START", 0))
+        ep_end = int(os.environ.get("COLLECT_EP_END", args["episode_num"]))
+        seed_offset = int(os.environ.get("COLLECT_SEED_OFFSET", 0))
+        range_mode = ("COLLECT_EP_START" in os.environ) or ("COLLECT_EP_END" in os.environ)
 
-        for episode_idx in range(st_idx, args["episode_num"]):
-            print(f"\033[34mTask name: {args['task_name']}\033[0m")
-
-            TASK_ENV.setup_demo(now_ep_num=episode_idx, seed=seed_list[episode_idx], **args)
-
-            traj_data = TASK_ENV.load_tran_data(episode_idx)
-            args["left_joint_path"] = traj_data["left_joint_path"]
-            args["right_joint_path"] = traj_data["right_joint_path"]
-            TASK_ENV.set_path_lst(args)
-
+        # In range mode each worker keeps its own scene_info shard (merged later)
+        # to avoid racing on the shared json file.
+        if range_mode:
+            info_file_path = os.path.join(args["save_path"], f"scene_info_part_{ep_start}_{ep_end}.json")
+        else:
             info_file_path = os.path.join(args["save_path"], "scene_info.json")
+        if not os.path.exists(info_file_path):
+            with open(info_file_path, "w", encoding="utf-8") as file:
+                json.dump({}, file, ensure_ascii=False)
 
-            if not os.path.exists(info_file_path):
-                with open(info_file_path, "w", encoding="utf-8") as file:
-                    json.dump({}, file, ensure_ascii=False)
+        seed_file_path = os.path.join(args["save_path"], "seed.txt")
+
+        # Some tasks (e.g. contact-rich mid-air hand-offs) do not always
+        # reproduce their seed-phase result when the recorded trajectory is
+        # replayed open-loop, so a single failed replay must NOT abort the whole
+        # collection. We retry the recorded trajectory a few times and, if it
+        # still cannot be reproduced, fall back to collecting a fresh online
+        # plan with a new seed (same procedure the seed phase already validated).
+        REPLAY_RETRY = 2
+        MAX_REPLAN = 40
+        next_fresh_seed = (max(seed_list) + 1 if len(seed_list) > 0 else 0) + seed_offset
+        used_seeds = set(seed_list)
+
+        def collect_once(ep_idx, seed, need_plan):
+            """Run one full collection attempt; returns (success, info)."""
+            args["need_plan"] = need_plan
+            TASK_ENV.setup_demo(now_ep_num=ep_idx, seed=seed, **args)
+            if need_plan:
+                args["left_joint_path"] = []
+                args["right_joint_path"] = []
+            else:
+                traj_data = TASK_ENV.load_tran_data(ep_idx)
+                args["left_joint_path"] = traj_data["left_joint_path"]
+                args["right_joint_path"] = traj_data["right_joint_path"]
+            TASK_ENV.set_path_lst(args)
+            info = TASK_ENV.play_once()
+            TASK_ENV.close_env(clear_cache=((ep_idx + 1) % clear_cache_freq == 0))
+            TASK_ENV.merge_pkl_to_hdf5_video()
+            TASK_ENV.remove_data_cache()
+            success = TASK_ENV.plan_success and TASK_ENV.check_success()
+            return success, info
+
+        for episode_idx in range(ep_start, ep_end):
+            if exist_hdf5(episode_idx):
+                continue
+            print(f"\033[34mTask name: {args['task_name']} | collecting episode {episode_idx}\033[0m")
+
+            collected_info = None
+
+            # 1) Replay the pre-planned trajectory for this index (with retries).
+            for attempt in range(REPLAY_RETRY):
+                try:
+                    ok, info = collect_once(episode_idx, seed_list[episode_idx], need_plan=False)
+                except Exception as e:
+                    print(f"[Collect] episode {episode_idx} replay attempt {attempt + 1} raised: {e}")
+                    ok = False
+                if ok:
+                    collected_info = info
+                    break
+                print(f"[Collect] episode {episode_idx} replay did not reproduce check_success "
+                      f"(attempt {attempt + 1}/{REPLAY_RETRY}, seed={seed_list[episode_idx]})")
+
+            # 2) Fall back to online re-planning with fresh seeds until one works.
+            replan_tries = 0
+            while collected_info is None and replan_tries < MAX_REPLAN:
+                while next_fresh_seed in used_seeds:
+                    next_fresh_seed += 1
+                seed = next_fresh_seed
+                used_seeds.add(seed)
+                next_fresh_seed += 1
+                replan_tries += 1
+                try:
+                    ok, info = collect_once(episode_idx, seed, need_plan=True)
+                except Exception as e:
+                    print(f"[Collect] episode {episode_idx} replan seed={seed} raised: {e}")
+                    ok = False
+                if ok:
+                    print(f"[Collect] episode {episode_idx} re-planned successfully with new seed={seed}")
+                    seed_list[episode_idx] = seed
+                    TASK_ENV.save_traj_data(episode_idx)
+                    # Skip rewriting the shared seed.txt in range mode (parallel
+                    # workers would race on it); the per-episode _traj_data is
+                    # already persisted above.
+                    if not range_mode:
+                        with open(seed_file_path, "w") as file:
+                            for sed in seed_list:
+                                file.write("%s " % sed)
+                    collected_info = info
+                else:
+                    print(f"[Collect] episode {episode_idx} replan seed={seed} failed "
+                          f"({replan_tries}/{MAX_REPLAN})")
+
+            if collected_info is None:
+                raise RuntimeError(
+                    f"Failed to collect episode {episode_idx} after {REPLAY_RETRY} replay "
+                    f"retries and {MAX_REPLAN} replans")
 
             with open(info_file_path, "r", encoding="utf-8") as file:
                 info_db = json.load(file)
-
-            info = TASK_ENV.play_once()
-            info_db[f"episode_{episode_idx}"] = info
-
+            info_db[f"episode_{episode_idx}"] = collected_info
             with open(info_file_path, "w", encoding="utf-8") as file:
                 json.dump(info_db, file, ensure_ascii=False, indent=4)
 
-            TASK_ENV.close_env(clear_cache=((episode_idx + 1) % clear_cache_freq == 0))
-            TASK_ENV.merge_pkl_to_hdf5_video()
-            TASK_ENV.remove_data_cache()
-            assert TASK_ENV.check_success(), "Collect Error"
-
-        command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
-        os.system(command)
+        # In range mode, language-instruction generation is run once externally
+        # after all workers finish and the scene_info shards are merged.
+        if not range_mode:
+            command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
+            os.system(command)
 
 
 if __name__ == "__main__":
